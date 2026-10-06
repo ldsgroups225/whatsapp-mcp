@@ -106,6 +106,18 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+### Request older chat history
+
+When the bridge is connected, request up to 50 messages older than the oldest locally stored message in a chat:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/backfill \
+  -H 'Content-Type: application/json' \
+  -d '{"chat":"1234567890@s.whatsapp.net","count":50}'
+```
+
+The request needs an existing message in that chat as an anchor. WhatsApp sends history asynchronously. To continue requesting older pages until a date, run `python3 backfill.py YYYY-MM-DD <chat_jid>` from `whatsapp-bridge/` while the bridge is running. The phone must be online; the script waits up to 60 seconds for each response.
+
 ## Architecture Overview
 
 This application consists of two main components:

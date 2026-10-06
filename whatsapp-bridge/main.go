@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -50,7 +53,7 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0700); err != nil {
+	if err := ensurePrivateDirectory("store"); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
@@ -730,6 +733,70 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+func ensurePrivateDirectory(path string) error {
+	if err := os.Mkdir(path, 0700); err != nil && !os.IsExist(err) {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%s must be a real directory", path)
+	}
+	return nil
+}
+
+func openPrivateMediaRoot(path string) (*os.Root, error) {
+	if err := ensurePrivateDirectory(path); err != nil {
+		return nil, err
+	}
+	parent, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+	return parent.OpenRoot(filepath.Base(path))
+}
+
+func openPrivateChildDir(root *os.Root, name string) (*os.Root, error) {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\\`) {
+		return nil, fmt.Errorf("invalid media directory name")
+	}
+	if err := root.Mkdir(name, 0700); err != nil && !os.IsExist(err) {
+		return nil, err
+	}
+	info, err := root.Lstat(name)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, fmt.Errorf("media directory must be a real directory")
+	}
+	return root.OpenRoot(name)
+}
+
+func mediaStorageName(chatJID, messageID, mediaType, displayName string) string {
+	digest := sha256.Sum256([]byte(chatJID + "\x00" + messageID))
+	ext := strings.ToLower(filepath.Ext(strings.ReplaceAll(displayName, "\\", "/")))
+	validExtension := false
+	switch mediaType {
+	case "image":
+		validExtension = ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".webp"
+	case "video":
+		validExtension = ext == ".mp4" || ext == ".mov" || ext == ".avi"
+	case "audio":
+		validExtension = ext == ".ogg" || ext == ".opus" || ext == ".mp3" || ext == ".m4a" || ext == ".wav"
+	case "document":
+		validExtension = ext == ".pdf" || ext == ".txt" || ext == ".csv" || ext == ".doc" || ext == ".docx" || ext == ".xls" || ext == ".xlsx" || ext == ".ppt" || ext == ".pptx" || ext == ".zip" || ext == ".json"
+	}
+	if !validExtension {
+		ext = ".bin"
+	}
+	return fmt.Sprintf("%x%s", digest[:], ext)
+}
+
+func isSafeLegacyMediaName(name string) bool {
+	return name != "" && name != "." && name != ".." && filepath.Base(name) == name && filepath.VolumeName(name) == "" && !strings.ContainsAny(name, `/\\`) && !strings.ContainsRune(name, '\x00')
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
@@ -737,10 +804,6 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 	var err error
-
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
-	localPath := ""
 
 	// Get media info from the database
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
@@ -762,24 +825,45 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0700); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
-	}
-
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
-
-	// Get absolute path
-	absPath, err := filepath.Abs(localPath)
+	chatDir := strings.ReplaceAll(chatJID, ":", "_")
+	storeRoot, err := openPrivateMediaRoot("store")
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+		return false, "", "", "", fmt.Errorf("failed to open media store: %v", err)
 	}
+	defer storeRoot.Close()
+	chatRoot, err := openPrivateChildDir(storeRoot, chatDir)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to open chat directory: %v", err)
+	}
+	defer chatRoot.Close()
 
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+	storePath, err := filepath.Abs("store")
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to get media store path: %v", err)
+	}
+	storageName := mediaStorageName(chatJID, messageID, mediaType, filename)
+	localPath := filepath.Join(storePath, chatDir, storageName)
+	for _, candidate := range []string{storageName, filename} {
+		if candidate == filename && !isSafeLegacyMediaName(filename) {
+			continue
+		}
+		info, statErr := chatRoot.Lstat(candidate)
+		if os.IsNotExist(statErr) {
+			continue
+		}
+		if statErr != nil || !info.Mode().IsRegular() {
+			return false, "", "", "", fmt.Errorf("invalid cached media file")
+		}
+		file, openErr := chatRoot.Open(candidate)
+		if openErr != nil {
+			return false, "", "", "", fmt.Errorf("failed to open cached media: %v", openErr)
+		}
+		fileInfo, statErr := file.Stat()
+		_ = file.Close()
+		if statErr != nil || !fileInfo.Mode().IsRegular() {
+			return false, "", "", "", fmt.Errorf("invalid cached media file")
+		}
+		return true, mediaType, filename, filepath.Join(storePath, chatDir, candidate), nil
 	}
 
 	// If we don't have all the media info we need, we can't download
@@ -823,13 +907,29 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
-	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
+	// Write to a temporary file inside the rooted chat directory, then rename
+	// atomically so concurrent requests never return a partial cached file.
+	tempName := fmt.Sprintf(".%s.%d.tmp", storageName, time.Now().UnixNano())
+	temp, err := chatRoot.OpenFile(tempName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to create media file: %v", err)
+	}
+	if _, err := temp.Write(mediaData); err != nil {
+		_ = temp.Close()
+		_ = chatRoot.Remove(tempName)
+		return false, "", "", "", fmt.Errorf("failed to write media file: %v", err)
+	}
+	if err := temp.Close(); err != nil {
+		_ = chatRoot.Remove(tempName)
+		return false, "", "", "", fmt.Errorf("failed to close media file: %v", err)
+	}
+	if err := chatRoot.Rename(tempName, storageName); err != nil {
+		_ = chatRoot.Remove(tempName)
+		return false, "", "", "", fmt.Errorf("failed to store media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, localPath, len(mediaData))
+	return true, mediaType, filename, localPath, nil
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -847,6 +947,134 @@ func extractDirectPathFromURL(url string) string {
 	// whatsmeow rebuilds the download URL from this path, so stripping the
 	// query causes the CDN to reject otherwise valid media with HTTP 403.
 	return "/" + parts[1]
+}
+
+const maxHistoryBackfillCount = 50
+
+type historyBackfillRequest struct {
+	Chat  string `json:"chat"`
+	Count *int   `json:"count"`
+}
+
+func parseHistoryBackfillRequest(w http.ResponseWriter, r *http.Request) (types.JID, int, error) {
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		return types.JID{}, 0, fmt.Errorf("Content-Type must be application/json")
+	}
+
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	decoder.DisallowUnknownFields()
+	var req historyBackfillRequest
+	if err := decoder.Decode(&req); err != nil {
+		return types.JID{}, 0, fmt.Errorf("invalid request body")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return types.JID{}, 0, fmt.Errorf("request body must contain one JSON object")
+	}
+	if req.Chat == "" || strings.Count(req.Chat, "@") != 1 || strings.TrimSpace(req.Chat) != req.Chat {
+		return types.JID{}, 0, fmt.Errorf("valid chat JID required")
+	}
+	jid, err := types.ParseJID(req.Chat)
+	if err != nil || jid.User == "" || jid.IsEmpty() {
+		return types.JID{}, 0, fmt.Errorf("valid chat JID required")
+	}
+
+	count := maxHistoryBackfillCount
+	if req.Count != nil {
+		if *req.Count < 1 || *req.Count > maxHistoryBackfillCount {
+			return types.JID{}, 0, fmt.Errorf("count must be between 1 and %d", maxHistoryBackfillCount)
+		}
+		count = *req.Count
+	}
+	return jid, count, nil
+}
+
+func historyBackfillHandler(client *whatsmeow.Client, messageStore *MessageStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		jid, count, err := parseHistoryBackfillRequest(w, r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() || client.Store.ID == nil {
+			http.Error(w, "client not connected", http.StatusServiceUnavailable)
+			return
+		}
+
+		var info types.MessageInfo
+		var sender string
+		err = messageStore.db.QueryRow(
+			`SELECT id, sender, timestamp, is_from_me FROM messages WHERE chat_jid = ? AND id != '' ORDER BY timestamp ASC LIMIT 1`,
+			jid.String(),
+		).Scan(&info.ID, &sender, &info.Timestamp, &info.IsFromMe)
+		if err == sql.ErrNoRows {
+			http.Error(w, "no stored message for chat", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, "failed to read stored message", http.StatusInternalServerError)
+			return
+		}
+
+		info.Chat = jid
+		info.IsGroup = jid.Server == types.GroupServer
+		if info.IsFromMe {
+			info.Sender = client.Store.ID.ToNonAD()
+		} else if info.IsGroup {
+			info.Sender = types.NewJID(sender, types.DefaultUserServer)
+		} else {
+			info.Sender = jid
+		}
+		msg := client.BuildHistorySyncRequest(&info, count)
+		if _, err := client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), msg, whatsmeow.SendRequestExtra{Peer: true}); err != nil {
+			http.Error(w, "history request failed", http.StatusBadGateway)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"requested":    count,
+			"chat":         jid.String(),
+			"oldest_known": info.Timestamp.Format(time.RFC3339),
+			"oldest_id":    info.ID,
+		})
+	}
+}
+
+func localBridgeRequestGuard(port int, next http.Handler) http.Handler {
+	localHosts := []string{fmt.Sprintf("127.0.0.1:%d", port), fmt.Sprintf("localhost:%d", port)}
+	localOrigins := []string{"http://" + localHosts[0], "http://" + localHosts[1]}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hostAllowed := false
+		for _, host := range localHosts {
+			if strings.EqualFold(r.Host, host) {
+				hostAllowed = true
+				break
+			}
+		}
+		originAllowed := len(r.Header.Values("Origin")) == 0
+		if origins := r.Header.Values("Origin"); len(origins) == 1 {
+			for _, origin := range localOrigins {
+				if origins[0] == origin {
+					originAllowed = true
+					break
+				}
+			}
+		}
+		if !hostAllowed || !originAllowed {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -948,13 +1176,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	http.HandleFunc("/api/backfill", historyBackfillHandler(client, messageStore))
+
 	// Start the server
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		handler := localBridgeRequestGuard(port, http.DefaultServeMux)
+		if err := http.ListenAndServe(serverAddr, handler); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -969,7 +1200,7 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0700); err != nil {
+	if err := ensurePrivateDirectory("store"); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}

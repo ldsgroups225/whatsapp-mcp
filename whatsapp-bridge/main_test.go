@@ -1,12 +1,136 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestParseHistoryBackfillRequest(t *testing.T) {
+	validChat := "1234567890@s.whatsapp.net"
+	cases := []struct {
+		name      string
+		body      string
+		mediaType string
+		wantCount int
+		wantError bool
+	}{
+		{"default count", `{"chat":"` + validChat + `"}`, "application/json", 50, false},
+		{"minimum count", `{"chat":"` + validChat + `","count":1}`, "application/json", 1, false},
+		{"maximum count", `{"chat":"` + validChat + `","count":50}`, "application/json", 50, false},
+		{"zero count", `{"chat":"` + validChat + `","count":0}`, "application/json", 0, true},
+		{"negative count", `{"chat":"` + validChat + `","count":-1}`, "application/json", 0, true},
+		{"count above cap", `{"chat":"` + validChat + `","count":51}`, "application/json", 0, true},
+		{"invalid chat", `{"chat":"not-a-jid","count":10}`, "application/json", 0, true},
+		{"unknown field", `{"chat":"` + validChat + `","limit":10}`, "application/json", 0, true},
+		{"trailing value", `{"chat":"` + validChat + `"} {}`, "application/json", 0, true},
+		{"wrong content type", `{"chat":"` + validChat + `"}`, "text/plain", 0, true},
+		{"oversized body", `{"chat":"` + validChat + `"}` + strings.Repeat(" ", 5000), "application/json", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/api/backfill", strings.NewReader(tc.body))
+			r.Header.Set("Content-Type", tc.mediaType)
+			w := httptest.NewRecorder()
+			jid, count, err := parseHistoryBackfillRequest(w, r)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("parse error = %v, wantError %t", err, tc.wantError)
+			}
+			if err == nil && (jid.String() != validChat || count != tc.wantCount) {
+				t.Fatalf("parsed chat/count = %q/%d, want %q/%d", jid, count, validChat, tc.wantCount)
+			}
+		})
+	}
+}
+
+func TestHistoryBackfillRequiresPost(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/api/backfill", nil)
+	w := httptest.NewRecorder()
+	historyBackfillHandler(nil, nil).ServeHTTP(w, r)
+	if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("GET response = %d, Allow %q; want 405 and POST", w.Code, w.Header().Get("Allow"))
+	}
+}
+
+func TestLocalBridgeRequestGuard(t *testing.T) {
+	tests := []struct {
+		name       string
+		host       string
+		origins    []string
+		wantStatus int
+	}{
+		{"local client without origin", "127.0.0.1:8080", nil, http.StatusNoContent},
+		{"same local origin", "localhost:8080", []string{"http://localhost:8080"}, http.StatusNoContent},
+		{"rejects DNS rebinding host", "attacker.example:8080", nil, http.StatusForbidden},
+		{"rejects cross-origin browser request", "127.0.0.1:8080", []string{"https://attacker.example"}, http.StatusForbidden},
+		{"rejects duplicate origins", "localhost:8080", []string{"http://localhost:8080", "https://attacker.example"}, http.StatusForbidden},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/send", nil)
+			r.Host = tc.host
+			for _, origin := range tc.origins {
+				r.Header.Add("Origin", origin)
+			}
+			w := httptest.NewRecorder()
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			localBridgeRequestGuard(8080, next).ServeHTTP(w, r)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestMediaStorageNameDoesNotUseRemotePath(t *testing.T) {
+	name := mediaStorageName("123@g.us", "message-1", "document", `../../../../etc/passwd`)
+	if strings.ContainsAny(name, `/\\`) || name == "" || filepath.Base(name) != name || !strings.HasSuffix(name, ".bin") {
+		t.Fatalf("unsafe storage name %q", name)
+	}
+}
+
+func TestEnsurePrivateDirectoryRejectsSymlink(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "store")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := ensurePrivateDirectory(link); err == nil {
+		t.Fatal("expected symlink store directory to be rejected")
+	}
+}
+
+func TestOpenPrivateChildDirRejectsSymlink(t *testing.T) {
+	base := t.TempDir()
+	storePath := filepath.Join(base, "store")
+	if err := os.Mkdir(storePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := openPrivateMediaRoot(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(storePath, "chat")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := openPrivateChildDir(root, "chat"); err == nil {
+		t.Fatal("expected symlink chat directory to be rejected")
+	}
+}
 
 func TestExtractStickerMediaInfo(t *testing.T) {
 	sticker := &waProto.Message{StickerMessage: &waProto.StickerMessage{
