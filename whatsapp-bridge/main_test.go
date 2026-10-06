@@ -132,6 +132,67 @@ func TestOpenPrivateChildDirRejectsSymlink(t *testing.T) {
 	}
 }
 
+func TestBridgeTokenPersists(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "store")
+	first, err := loadOrCreateBridgeToken(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := loadOrCreateBridgeToken(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 64 || first != second {
+		t.Fatalf("token was not persisted as 32-byte hex: %q / %q", first, second)
+	}
+}
+
+func TestBridgeTokenRejectsSymlink(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "store")
+	if err := os.Mkdir(store, 0700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(target, []byte(strings.Repeat("a", 64)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(store, ".bridge-token")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := loadOrCreateBridgeToken(store); err == nil {
+		t.Fatal("expected symlink token file to be rejected")
+	}
+}
+
+func TestBridgeAuthRequiresOneValidBearerToken(t *testing.T) {
+	tests := []struct {
+		name       string
+		authority  []string
+		wantStatus int
+	}{
+		{"missing", nil, http.StatusUnauthorized},
+		{"wrong", []string{"Bearer wrong"}, http.StatusUnauthorized},
+		{"correct", []string{"Bearer secret"}, http.StatusNoContent},
+		{"duplicate", []string{"Bearer secret", "Bearer secret"}, http.StatusUnauthorized},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/api/send", nil)
+			for _, value := range tc.authority {
+				r.Header.Add("Authorization", value)
+			}
+			w := httptest.NewRecorder()
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			localBridgeAuth("secret", next).ServeHTTP(w, r)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tc.wantStatus)
+			}
+		})
+	}
+}
+
 func TestExtractStickerMediaInfo(t *testing.T) {
 	sticker := &waProto.Message{StickerMessage: &waProto.StickerMessage{
 		URL:           proto.String("https://media.example/sticker.enc"),

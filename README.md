@@ -112,11 +112,12 @@ When the bridge is connected, request up to 50 messages older than the oldest lo
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/backfill \
+  -H "Authorization: Bearer $(cat whatsapp-bridge/store/.bridge-token)" \
   -H 'Content-Type: application/json' \
   -d '{"chat":"1234567890@s.whatsapp.net","count":50}'
 ```
 
-The request needs an existing message in that chat as an anchor. WhatsApp sends history asynchronously. To continue requesting older pages until a date, run `python3 backfill.py YYYY-MM-DD <chat_jid>` from `whatsapp-bridge/` while the bridge is running. The phone must be online; the script waits up to 60 seconds for each response.
+Every bridge API route requires `Authorization: Bearer <token>`. The bridge creates the token at `whatsapp-bridge/store/.bridge-token`, and the MCP client reads it automatically; start the bridge before the MCP server or this script. The request needs an existing message in that chat as an anchor. WhatsApp sends history asynchronously. To continue requesting older pages until a date, run `python3 backfill.py YYYY-MM-DD <chat_jid>` from `whatsapp-bridge/` while the bridge is running. The phone must be online; the script waits up to 60 seconds for each response.
 
 ## Architecture Overview
 

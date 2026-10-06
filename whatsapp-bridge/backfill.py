@@ -42,14 +42,15 @@ def main():
                 print(f"{chat}: reached {before[:10]} ({n_before} messages)")
                 break
 
-            body = json.dumps({"chat": chat, "count": COUNT}).encode()
-            request = urllib.request.Request(
-                BRIDGE + "/api/backfill",
-                data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
             try:
+                body = json.dumps({"chat": chat, "count": COUNT}).encode()
+                token = (DB.parent / ".bridge-token").read_text(encoding="ascii").strip()
+                request = urllib.request.Request(
+                    BRIDGE + "/api/backfill",
+                    data=body,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                    method="POST",
+                )
                 with urllib.request.urlopen(request, timeout=90) as response:
                     json.loads(response.read())
             except Exception as exc:

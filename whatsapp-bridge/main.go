@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1048,6 +1051,84 @@ func historyBackfillHandler(client *whatsmeow.Client, messageStore *MessageStore
 	}
 }
 
+func loadOrCreateBridgeToken(storePath string) (string, error) {
+	const filename = ".bridge-token"
+	root, err := openPrivateMediaRoot(storePath)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+
+	info, err := root.Lstat(filename)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return "", fmt.Errorf("bridge token must be a regular file")
+		}
+		file, err := root.Open(filename)
+		if err != nil {
+			return "", err
+		}
+		fileInfo, statErr := file.Stat()
+		if statErr != nil || !fileInfo.Mode().IsRegular() {
+			_ = file.Close()
+			return "", fmt.Errorf("bridge token must be a regular file")
+		}
+		data, readErr := io.ReadAll(io.LimitReader(file, 65))
+		if readErr == nil && fileInfo.Mode().Perm()&0077 != 0 {
+			readErr = file.Chmod(0600)
+		}
+		closeErr := file.Close()
+		if readErr != nil {
+			return "", readErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		if len(data) != 64 {
+			return "", fmt.Errorf("bridge token must contain 32 random bytes encoded as hex")
+		}
+		if _, err := hex.DecodeString(string(data)); err != nil {
+			return "", fmt.Errorf("bridge token is invalid")
+		}
+		return string(data), nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	rawToken := make([]byte, 32)
+	if _, err := cryptorand.Read(rawToken); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(rawToken)
+	file, err := root.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.WriteString(file, token); err != nil {
+		_ = file.Close()
+		_ = root.Remove(filename)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		_ = root.Remove(filename)
+		return "", err
+	}
+	return token, nil
+}
+
+func localBridgeAuth(token string, next http.Handler) http.Handler {
+	expected := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := r.Header.Values("Authorization")
+		if len(authorization) != 1 || subtle.ConstantTimeCompare([]byte(authorization[0]), expected) != 1 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func localBridgeRequestGuard(port int, next http.Handler) http.Handler {
 	localHosts := []string{fmt.Sprintf("127.0.0.1:%d", port), fmt.Sprintf("localhost:%d", port)}
 	localOrigins := []string{"http://" + localHosts[0], "http://" + localHosts[1]}
@@ -1079,6 +1160,11 @@ func localBridgeRequestGuard(port int, next http.Handler) http.Handler {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	token, err := loadOrCreateBridgeToken("store")
+	if err != nil {
+		fmt.Printf("REST API server error: failed to initialize authentication: %v\n", err)
+		return
+	}
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -1184,7 +1270,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		handler := localBridgeRequestGuard(port, http.DefaultServeMux)
+		handler := localBridgeRequestGuard(port, localBridgeAuth(token, http.DefaultServeMux))
 		if err := http.ListenAndServe(serverAddr, handler); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
